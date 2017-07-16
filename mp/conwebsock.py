@@ -41,29 +41,63 @@ class ConWebsock(ConBase, threading.Thread):
 
         self.daemon = True
 
+        # List of strings, data received from websocket but yet to be
+        # processed.
         self.fifo = deque()
-        self.fifo_lock = threading.Lock()
+        # Signal that there is new data available. When incoming messages arrive over
+        # websocket, we notify on this condition variable.
+        self.fifo_has_data = threading.Condition()
 
-        # websocket.enableTrace(logging.root.getEffectiveLevel() < logging.INFO)
+        websocket.enableTrace(logging.root.getEffectiveLevel() < logging.INFO)
+
+        self.ip = ip
+        self.password = password
         self.ws = websocket.WebSocketApp("ws://%s:8266" % ip,
+                                         on_open=self.on_open,
                                          on_message=self.on_message,
                                          on_error=self.on_error,
                                          on_close=self.on_close)
 
         self.start()
+        self.authenticate()
 
+    def on_open(self, ws):
+        """Called when we connect to the websocket server."""
+        logging.debug("websocket on_open()")
+
+    def authenticate(self):
         self.timeout = 5.0
-
-        if b'Password:' in self.read(256, blocking=False):
-            self.ws.send(password + "\r")
-            if not b'WebREPL connected' in self.read(256, blocking=False):
-                raise ConError()
-        else:
-            raise ConError()
-
+        # Authenticate.
+        self.wait_for_string("Password: ")
+        self.ws.send(self.password + "\r")
+        self.wait_for_string("WebREPL connected")
         self.timeout = 1.0
 
-        logging.info("websocket connected to ws://%s:8266" % ip)
+        logging.info("websocket connected to ws://%s:8266" % self.ip)
+
+    def wait_for_string(self, string):
+        """Reads data until we see a given string or reach timeout."""
+        data = ""
+
+        tstart = time.time()
+
+        while True:
+            with self.fifo_has_data:
+                elapsed_time = time.time() - tstart
+                remaining_time = self.timeout - elapsed_time
+                if remaining_time < 0:
+                    raise ConError("Timed out waiting for '%s'" % string)
+                if self.fifo:
+                    # If there is data in the fifo, append it to data string.
+                    data += self.fifo.popleft()
+                    # See if out string shows up.
+                    if string in data:
+                        # It does, put stuff after the string back in the deque.
+                        _, after = data.split(string, 1)
+                        self.fifo.appendleft(after)
+                        return
+                else:
+                    self.fifo_has_data.wait(remaining_time)
 
     def run(self):
         self.ws.run_forever()
@@ -72,59 +106,52 @@ class ConWebsock(ConBase, threading.Thread):
         self.close()
 
     def on_message(self, ws, message):
-        self.fifo.extend(message)
-
-        try:
-            self.fifo_lock.release()
-        except:
-            pass
+        with self.fifo_has_data:
+            self.fifo.append(message)
+            self.fifo_has_data.notify_all()
 
     def on_error(self, ws, error):
         logging.error("websocket error: %s" % error)
-
-        try:
-            self.fifo_lock.release()
-        except:
-            pass
+        with self.fifo_has_data:
+            self.fifo_has_data.notify_all()
 
     def on_close(self, ws):
         logging.info("websocket closed")
-
-        try:
-            self.fifo_lock.release()
-        except:
-            pass
+        with self.fifo_has_data:
+            # TODO: we might want to set a flag here so that the reader can
+            # exit.
+            self.fifo_has_data.notify_all()
 
     def close(self):
         try:
             self.ws.close()
+        finally:
+            with self.fifo_has_data:
+                self.fifo_has_data.notify_all()
 
-            try:
-                self.fifo_lock.release()
-            except:
-                pass
-
-            self.join()
-        except Exception:
-            try:
-                self.fifo_lock.release()
-            except:
-                pass
-
-    def read(self, size=1, blocking=True):
-
-        data = ''
+    def read(self, size=1):
+        """Reads up to size (or timeout), returns bytes."""
+        # List of strings, joined together at the end for efficiency.
+        data = []
 
         tstart = time.time()
 
-        while (len(data) < size) and (time.time() - tstart < self.timeout):
+        while len(data) < size:
+            with self.fifo_has_data:
+                elapsed_time = time.time() - tstart
+                remaining_time = self.timeout - elapsed_time
+                if remaining_time < 0:
+                    break
+                if self.fifo:
+                    # If there is data in the fifo, grab it.
+                    data.append(self.fifo.popleft())
+                else:
+                    # If there is no data in fifo yet, but we have not
+                    # reached timeout yet, wait. We will get woken
+                    # up if new data arrives.
+                    self.fifo_has_data.wait(remaining_time)
 
-            if len(self.fifo) > 0:
-                data += self.fifo.popleft()
-            elif blocking:
-                self.fifo_lock.acquire()
-
-        return data.encode("utf-8")
+        return ''.join(data).encode("utf-8")
 
     def write(self, data):
 
